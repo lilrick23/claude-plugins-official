@@ -3,14 +3,13 @@
 #
 # On Windows + Git Bash, `python3` typically resolves to the Microsoft Store
 # stub at C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\python3, which
-# exits 49 silently in non-TTY subprocess context (a known Microsoft Store
-# stub behavior). This shim
-# probes each candidate with `-c ""` and skips any that fails, so the Store
-# stub falls through to the real python.org install (`python` in Git Bash) or
+# is not a Python; it is told by its link and not started (sg_is_redirector).
+# This shim probes each other candidate with `-c ""` and skips any that fails,
+# so the search reaches the real python.org install (`python` in Git Bash) or
 # the `py -3` launcher.
 #
 # Order:
-#   1. python3   — canonical on macOS/Linux; the Store stub fails the probe.
+#   1. python3   — canonical on macOS/Linux; the Store stub is skipped.
 #   2. python    — python.org installs on Windows; some Linux distros (RHEL 7
 #                  EOL'd 2024-06) point this at Python 2, but `-c ""` succeeds
 #                  on Python 2 too — guard with a version check.
@@ -100,10 +99,15 @@ probe() {
     # the model, whose reply runs the Stop hook again: an endless loop that
     # never reviewed anything. See #6251, #5781.
     #
+    # On Windows a second line carries sys.executable (see sg_own_path).
+    #
     # Only for `$(probe ...)`: the `exec` replaces that subshell instead of
     # forking a second process from it.
     [ "${BASH_SUBSHELL:-0}" -gt 0 ] || return 1
-    exec "$@" -c 'import os, sys; t = (sys.argv[1:] or [""])[0]; sys.exit(3) if t and not (os.path.isfile(t) and os.access(t, os.R_OK)) else print(f"{sys.version_info[0]}.{sys.version_info[1]}")' "$SG_TARGET" 2>/dev/null
+    # PYTHONSAFEPATH (3.11+, ignored before): the probe needs the standard
+    # library only, so Python is told not to add its usual first entry to the
+    # import path. For this call alone; the hook's environment is unchanged.
+    PYTHONSAFEPATH=1 exec "$@" -c 'import os, sys; t = (sys.argv[1:] or [""])[0]; sys.exit(3) if t and not (os.path.isfile(t) and os.access(t, os.R_OK)) else print(f"{sys.version_info[0]}.{sys.version_info[1]}"); sys.platform == "win32" and sys.version_info >= (3, 10) and print(sys.executable)' "$SG_TARGET" 2>/dev/null
 }
 
 # Use as `ask ... || { note_unreadable "<name>"; continue; }` (see ask below).
@@ -112,11 +116,50 @@ note_unreadable() {
     return 0
 }
 
+# Where packaged aliases exist (and bash has what telling them apart needs).
+sg_windows=""
+case "${OSTYPE:-}" in
+    msys*|cygwin*) [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] || sg_windows=1 ;;
+esac
+
 # True iff the command's executable is on PATH ($1 of a possibly multi-word
 # command like `py -3`). A builtin lookup: `$(probe ...)` costs a process even
-# when the interpreter does not exist, so missing names are skipped first.
+# when the interpreter does not exist, so missing names are skipped first. On
+# Windows a python or python3 that is only App Installer's alias counts as
+# missing; that check takes one process, in place of starting the alias.
+sg_skipped=""
 on_path() {
-    command -v "$1" >/dev/null 2>&1
+    case "$sg_windows:$1" in
+        1:python|1:python3)
+            hash "$1" 2>/dev/null || return 1
+            if sg_is_redirector "${BASH_CMDS[$1]:-}"; then
+                sg_skipped="${sg_skipped:+$sg_skipped, }$1"
+                return 1
+            fi ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+# True iff $1 is the path of App Installer's python or python3, which Windows
+# puts under ...\Microsoft\WindowsApps when no packaged Python is installed.
+# It is not a Python, it points the user to the Store, so nothing is lost by
+# telling it by where its link leads instead of starting it. Starting it is a
+# packaged app activation on every hook, and waits for Windows' package
+# services: normally a fraction of a second, but until they answer again when
+# they are stuck, in every session on the machine at once. See #3870, #6348.
+# Git Bash shows these aliases as symbolic links; where the link cannot be
+# read, the name is probed like any other. Aliases of a packaged Python are
+# interpreters and are probed too.
+sg_is_redirector() {
+    local to
+    [ -n "$sg_windows" ] && sg_is_alias_path "$1" || return 1
+    # Full path: another readlink on PATH may not know these links.
+    to=$(/usr/bin/readlink -- "$1" 2>/dev/null </dev/null) || return 1
+    # Not lowercased: the result would depend on the locale.
+    case "$to" in
+        *[/\\]Microsoft.DesktopAppInstaller_*) return 0 ;;
+    esac
+    return 1
 }
 
 # How long the probes took, for the launcher_probe_max_ms / launcher_probe_ms
@@ -142,11 +185,17 @@ sg_clock() {
     esac
 }
 ask() {
-    # Sets $v; same exit status as probe.
+    # Sets $v and $sg_exe; same exit status as probe.
     local rc=0 t0 ms
     sg_clock; t0=$sg_now
     [ -n "$sg_probe_first" ] || sg_probe_first=$t0
     v=$(probe "$@") || rc=$?
+    sg_exe=""
+    case "$v" in
+        *$'\n'*)
+            sg_exe=${v#*$'\n'}; sg_exe=${sg_exe%$'\r'}
+            v=${v%%$'\n'*} ;;
+    esac
     sg_clock; ms=$((sg_now - t0))
     if [ -n "$sg_coarse" ]; then
         [ "$ms" -ge 2000 ] || ms=0
@@ -175,6 +224,145 @@ is_sdk_compatible() {
     esac
 }
 
+# Packaged launcher aliases on Windows (python, python3 and py under
+# ...\Microsoft\WindowsApps): starting one starts more than Python. The
+# Python Install Manager's aliases make Windows check the package for an
+# update on each start, and the launcher started the chosen name twice per
+# hook, on every Edit, prompt and Stop. See anthropics/claude-code#98929.
+#
+# So when the name that answers is such an alias and its interpreter is a
+# regular file elsewhere, the hook runs with that file instead, and its path
+# is kept in the plugin's state folder (`launcher-python`) for a day. Later
+# hooks start it directly: one process, and none through the alias. The
+# remembered path is used only while PATH and the hook folder are what they
+# were when it was checked and the file is still there; anything else is the
+# full search below, which writes the entry again. A hook that fails on the
+# remembered path empties the entry, so the next one searches again; deleting
+# the file does the same by hand. One entry: sessions with different PATHs
+# take turns checking, which is still one alias start per hook instead of two.
+#
+# Not while a virtual environment is active: the alias may be answering for
+# that environment's interpreter, which other sessions should not inherit.
+#
+# Builtins only: nothing here starts a process on the remembered route.
+unset SG_LAUNCHER_DIRECT
+sg_args=("$@")
+sg_exe=""    # sys.executable from the last `ask` (Windows, Python 3.10+)
+sg_own=""    # set by sg_recall and sg_own_path
+sg_memo=""   # the entry's file; empty where none of this applies
+sg_target_dir=""
+case "${OSTYPE:-}" in
+    msys*|cygwin*)
+        if [ "${BASH_VERSINFO[0]:-0}" -ge 5 ] && [ -n "$SG_TARGET" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
+            # The folder _base.state_dir() resolves to.
+            sg_home="${USERPROFILE:-${HOME:-}}"
+            sg_memo="${SECURITY_WARNINGS_STATE_DIR:-}"
+            if [ -z "$sg_memo" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+                sg_memo="$CLAUDE_CONFIG_DIR/security"
+            fi
+            [ -n "$sg_memo" ] || sg_memo="~/.claude/security"
+            case "$sg_memo" in
+                "~"|"~"[\\/]*)
+                    if [ -n "$sg_home" ]; then sg_memo="$sg_home${sg_memo:1}"; else sg_memo=""; fi ;;
+            esac
+            [ -z "$sg_memo" ] || sg_memo="$sg_memo/launcher-python"
+            sg_target_dir="${SG_TARGET%[\\/]*}"
+        fi ;;
+esac
+
+sg_is_alias_path() {
+    case "${1,,}" in
+        */microsoft/windowsapps/*|*\\microsoft\\windowsapps\\*) return 0 ;;
+    esac
+    return 1
+}
+
+# An interpreter the remembered route may start: python*.exe by absolute
+# path, a regular file, and not an alias itself.
+sg_startable() {
+    local name="${1##*/}"
+    case "$1" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "${name,,}" in
+        python*.exe) ;;
+        *) return 1 ;;
+    esac
+    ! sg_is_alias_path "$1" || return 1
+    [ -f "$1" ] && [ -x "$1" ]
+}
+
+sg_recall() {
+    # Sets $sg_own to the remembered interpreter iff it may run this hook.
+    local tag saved path exe dir end age
+    [ -n "$sg_memo" ] && [ -r "$sg_memo" ] || return 1
+    {
+        IFS= read -r tag && IFS= read -r saved && IFS= read -r path &&
+            IFS= read -r exe && IFS= read -r dir && IFS= read -r end
+    } 2>/dev/null < "$sg_memo" || return 1
+    [ "$tag" = "sg-launcher-python 1" ] && [ "$end" = "end" ] || return 1
+    case "$saved" in
+        ""|*[!0-9]*|????????????*) return 1 ;;
+    esac
+    age=$((EPOCHSECONDS - 10#$saved))
+    [ "$age" -ge 0 ] && [ "$age" -lt 86400 ] || return 1
+    [ "$path" = "$PATH" ] && [ "$dir" = "$sg_target_dir" ] || return 1
+    sg_startable "$exe" && [ -r "$SG_TARGET" ] || return 1
+    sg_own="$exe"
+}
+
+sg_own_path() {
+    # $1: the name that just answered `ask` with version $v. Succeeds, with
+    # $sg_own set, iff that name is a packaged alias whose interpreter is a
+    # regular file elsewhere that reads the hook script when started by
+    # itself and is the same version. Remembers it for the next hooks.
+    local alias="" own="$sg_exe" want="$v" drive
+    [ -n "$sg_memo" ] && [ -n "$own" ] || return 1
+    hash "$1" 2>/dev/null && alias="${BASH_CMDS[$1]:-}"
+    sg_is_alias_path "$alias" || return 1
+    case "$own" in
+        [A-Za-z]:[\\/]*)
+            if [ -n "${sg_drive_mounts:-}" ]; then
+                drive="${own:0:1}"; own="/${drive,,}/${own:3}"; own="${own//\\//}"
+            else
+                own=$(cygpath -u "$own" 2>/dev/null) || return 1
+            fi ;;
+    esac
+    sg_startable "$own" || return 1
+    ask "$own" || { v=$want; return 1; }
+    v=${v%$'\r'}
+    [ "$v" = "$want" ] || { v=$want; return 1; }
+    sg_own="$own"
+    if [ -d "${sg_memo%/*}" ]; then
+        { printf '%s\n' "sg-launcher-python 1" "$EPOCHSECONDS" "$PATH" "$own" "$sg_target_dir" "end"; } \
+            2>/dev/null > "$sg_memo" || true
+    fi
+    return 0
+}
+
+# Use right before `exec <name> "$@"`: runs the hook with the interpreter
+# behind <name> instead when sg_own_path finds one, else returns.
+sg_direct() {
+    if sg_own_path "$@"; then
+        export SG_LAUNCHER_DIRECT=2
+        exec "$sg_own" "${sg_args[@]}"
+    fi
+    return 0
+}
+
+if sg_recall; then
+    export SG_LAUNCHER_DIRECT=1
+    # Not exec'd, so a failure can empty the entry: no probe checked this
+    # interpreter today, and a broken one must not fail every hook for a day.
+    sg_rc=0
+    "$sg_own" "$@" || sg_rc=$?
+    if [ "$sg_rc" -ne 0 ]; then
+        { : > "$sg_memo"; } 2>/dev/null || true
+    fi
+    exit "$sg_rc"
+fi
+
 # Pass 1 — try minor-versioned binaries in descending order. These are only
 # present if the user explicitly installed them (Homebrew / python.org / pyenv),
 # so picking one here always upgrades over the system `python3`. Highest
@@ -185,6 +373,7 @@ for cmd in "python3.13" "python3.12" "python3.11" "python3.10"; do
     ask "$cmd" || { note_unreadable "$cmd"; continue; }
     v=${v%$'\r'}
     if is_sdk_compatible "$v"; then
+        sg_direct "$cmd"
         exec "$cmd" "$@"
     fi
 done
@@ -200,6 +389,8 @@ for cmd in "python3" "python" "py -3"; do
     ask $cmd || { note_unreadable "$cmd"; continue; }
     v=${v%$'\r'}
     if is_sdk_compatible "$v"; then
+        # shellcheck disable=SC2086
+        sg_direct $cmd
         # shellcheck disable=SC2086
         exec $cmd "$@"
     fi
@@ -219,6 +410,7 @@ done
 for cmd in "python3.14" "python3.15" "python3.16" "python3.17" "python3.18" "python3.19"; do
     on_path "$cmd" || continue
     v=$(probe "$cmd") || { note_unreadable "$cmd"; continue; }
+    v=${v%%$'\n'*}
     v=${v%$'\r'}
     if is_sdk_compatible "$v"; then
         exec "$cmd" "$@"
@@ -250,7 +442,7 @@ for name in "python3" "python"; do
     first=1
     while IFS= read -r c; do
         if [ -n "$first" ]; then first=""; continue; fi
-        [ -n "$c" ] && sg_candidates+=("$c")
+        [ -n "$c" ] && ! sg_is_redirector "$c" && sg_candidates+=("$c")
     done <<EOF
 $(type -ap "$name" 2>/dev/null)
 EOF
@@ -258,7 +450,7 @@ done
 for cmd in "python3" "python" "py -3"; do
     case "$sg_unreadable" in *"|$cmd|"*) ;; *) continue ;; esac
     # shellcheck disable=SC2086
-    c=$($cmd -c 'import sys; print(sys.executable)' 2>/dev/null) || continue
+    c=$(PYTHONSAFEPATH=1 $cmd -c 'import sys; print(sys.executable)' 2>/dev/null) || continue
     c=${c%$'\r'}  # native Windows Python prints CRLF
     [ -n "$c" ] || continue
     if command -v cygpath >/dev/null 2>&1; then
@@ -298,6 +490,9 @@ if [ -n "$sg_unreadable" ]; then
 fi
 echo "security-guidance: no working Python 3 interpreter found." >&2
 echo "  tried: python3.13 to python3.10, python3, python, py -3, python3.14 to python3.19" >&2
+if [ -n "$sg_skipped" ]; then
+    echo "  not started: $sg_skipped (App Installer's alias, which is not a Python)" >&2
+fi
 echo "  on Windows, install Python from https://python.org (NOT the Microsoft Store)" >&2
 echo "  on macOS, install Python 3.10+ via Homebrew (\`brew install python\`)" >&2
 exit 1

@@ -18,6 +18,7 @@ import contextlib
 import errno
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,8 +28,39 @@ import time
 from _base import debug_log
 
 
+def _git_program(windows=os.name == "nt"):
+    """How to start git. On Windows a bare name is looked up in the process's
+    working directory before PATH, and the hooks run in the project, so a
+    `git.exe` there would start in place of the installed one. Name the first
+    git.exe on PATH instead, leaving out relative entries, the working
+    directory, and folders inside the project (unless the project holds the
+    home folder, and with it the user's own tools). With none, a path that
+    does not exist: git is reported missing, as it would be anywhere else."""
+    if not windows:
+        return "git"
+    def norm(p):
+        return os.path.normcase(os.path.normpath(p))
+    try:
+        cwd = norm(os.getcwd())
+    except OSError:
+        cwd = ""
+    home = norm(os.path.expanduser("~")) + os.sep
+    roots = [norm(r) for r in (cwd, os.environ.get("CLAUDE_PROJECT_DIR")) if r]
+    roots = [r.rstrip(os.sep) + os.sep for r in roots if not home.startswith(r.rstrip(os.sep) + os.sep)]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if not d or not os.path.isabs(d) or norm(d) == cwd:
+            continue
+        if any((norm(d) + os.sep).startswith(r) for r in roots):
+            continue
+        path = os.path.join(d, "git.exe")
+        if os.path.isfile(path):
+            return path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "git.exe")
+
+
 GIT_CMD = [
-    "git",
+    _git_program(),
     "-c", "core.fsmonitor=false",
     "-c", "core.hooksPath=/dev/null",
     # core.quotePath=false: emit raw UTF-8 in path-emitting commands instead
@@ -62,6 +94,10 @@ GIT_CMD = [
     # _drop_gitlinks for the commands that take no such setting.
     "-c", "diff.ignoreSubmodules=all",
     "-c", "diff.submodule=short",
+    # `git log` and `git show` print commit metadata for the hooks to parse.
+    # With log.showSignature set they would also verify each signed commit,
+    # adding lines to the output and starting the program gpg.program names.
+    "-c", "log.showSignature=false",
 ]
 
 # diff.ignoreSubmodules is a default that the repository's own settings for
@@ -74,6 +110,8 @@ SAFE_GIT_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("diff.ignoreSubmodules", "all"),
     ("diff.submodule", "short"),
+    ("log.showSignature", "false"),
+    ("safe.bareRepository", "explicit"),
 )
 
 # The hook's git runs in the background beside the session's own git. Without
@@ -101,6 +139,50 @@ def git_config_env(pairs, base=None):
 def apply_safe_git_env():
     os.environ.update(git_config_env(SAFE_GIT_CONFIG))
     os.environ.update(SAFE_GIT_ENV)
+
+
+def index_entry_count(path):
+    """The entry count in an index file's header (signature, version, count),
+    or None if it cannot be read. A split or sparse index holds fewer entries
+    than the repository has tracked files."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+    except OSError:
+        return None
+    if header[:4] == b"DIRC" and len(header) == 12:
+        return int.from_bytes(header[8:12], "big")
+    return None
+
+
+def windows_drive_mount(path, mountinfo):
+    """Whether `path` is on a Windows drive mounted into WSL, given the text
+    of /proc/self/mountinfo. Every file status there is a round trip to the
+    Windows host."""
+    best, best_type = "", ""
+    for line in mountinfo.splitlines():
+        # id parent dev root mountpoint options [tags] - fstype source options
+        before, _, after = line.partition(" - ")
+        fields, tail = before.split(), after.split()
+        if len(fields) < 5 or not tail:
+            continue
+        point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+        inside = path == point or path.startswith(point.rstrip("/") + "/")
+        if inside and len(point) >= len(best):
+            best, best_type = point, tail[0]
+    return best_type in ("9p", "drvfs", "virtiofs")
+
+
+def on_windows_drive(path):
+    """windows_drive_mount for this machine. False anywhere but WSL."""
+    try:
+        with open("/proc/sys/kernel/osrelease") as f:
+            if "microsoft" not in f.read().lower():
+                return False
+        with open("/proc/self/mountinfo") as f:
+            return windows_drive_mount(os.path.realpath(path), f.read())
+    except (OSError, ValueError):
+        return False
 
 
 def _git_rev_parse_head(cwd):
@@ -249,6 +331,20 @@ def _path_batches(paths, budget=None):
 # long once cut down) or "none_reviewable".
 _path_list_too_long = set()
 
+# A failed `git add --intent-to-add` during this hook run, for the Stop hook's
+# metrics: kind * 100000 + the paths the add was given. One number because a
+# review row is near CC's key cap. kind: 1 git could not write the empty blob
+# to the object store and the retry failed too, 2 any other git error, 3
+# timeout, 4 the retry with a private object directory worked. A git that
+# speaks another language reports a failed retry as 2. With 1 to 3 the new
+# files are not in the diff, so a turn that only added files looks like a turn
+# with no changes. `left_out` says so for the last get_git_diff alone: the code
+# stays set through a fallback diff that worked.
+_add_failed = {"code": 0, "left_out": False}
+
+# Next to an index copy: where a retried `git add -N` stores the empty blob.
+_OBJECTS_DIR_SUFFIX = ".objects"
+
 
 def _too_many_args(e):
     """The OS refused to start the command because its arguments are too
@@ -345,8 +441,9 @@ def _owner_is_gone(name):
 
 
 def _sweep_stale_indexes(dirpath, uid):
-    """Delete index copies in `dirpath` that a killed run left behind. Only
-    regular files owned by `uid` (None: no ownership check) are touched.
+    """Delete index copies in `dirpath` that a killed run left behind, and
+    their private object directories. Only regular files and directories owned
+    by `uid` (None: no ownership check) are touched.
 
     A copy goes as soon as the hook that made it is gone: a killed hook can
     leave one per run, and index-sized files fill a disk long before the age
@@ -369,12 +466,16 @@ def _sweep_stale_indexes(dirpath, uid):
         p = os.path.join(dirpath, name)
         try:
             st = os.lstat(p)
-            if not stat.S_ISREG(st.st_mode):
+            is_dir = stat.S_ISDIR(st.st_mode) and name.endswith(_OBJECTS_DIR_SUFFIX)
+            if not (is_dir or stat.S_ISREG(st.st_mode)):
                 continue
             if uid is not None and st.st_uid != uid:
                 continue
             if max(st.st_mtime, st.st_ctime) < cutoff or _owner_is_gone(name):
-                os.unlink(p)
+                if is_dir:
+                    _remove_objects_dir(p)
+                else:
+                    os.unlink(p)
                 if time.monotonic() > deadline:
                     return
         except OSError:
@@ -478,6 +579,24 @@ def _copy_slot(tmpdir, index_bytes=0):
             os.close(held)
 
 
+def _remove_objects_dir(path):
+    """Remove a private object directory. git writes objects read-only, which
+    stops Windows from deleting them."""
+    import shutil
+    import stat
+
+    def writable_then_retry(func, p, _exc):
+        # Not a link: chmod would follow it to whatever it points at.
+        if func in (os.unlink, os.rmdir) and not os.path.islink(p):
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+
+    try:
+        shutil.rmtree(path, onerror=writable_then_retry)
+    except OSError:
+        pass
+
+
 def _remove_copy(tmp_index):
     """Remove an index copy and the files git wrote next to it."""
     import glob
@@ -486,6 +605,7 @@ def _remove_copy(tmp_index):
             os.unlink(p)
         except OSError:
             pass
+    _remove_objects_dir(tmp_index + _OBJECTS_DIR_SUFFIX)
 
 
 def remove_copies_on_termination():
@@ -540,6 +660,85 @@ def _hook_tmpdir():
         pass
     _sweep_stale_indexes(d, uid)
     return d
+
+
+def _note_add_failure(kind, paths):
+    _add_failed["code"] = kind * 100000 + min(len(paths), 99999)
+    _add_failed["left_out"] = kind != 4
+
+
+def _env_with_private_objects(env, cwd, objects_dir):
+    """`env` for a git that writes objects to `objects_dir` and still reads
+    the repository's own, wherever git says they are (a linked worktree shares
+    them). A path holding the list separator is left out, since git would
+    split it; the add then fails only if it has to read an object."""
+    out = {**env, "GIT_OBJECT_DIRECTORY": objects_dir}
+    try:
+        r = subprocess.run([*GIT_CMD, "rev-parse", "--git-path", "objects"],
+                           cwd=cwd, capture_output=True, timeout=5, env=env)
+    except (subprocess.TimeoutExpired, OSError):
+        return out
+    own = os.path.join(cwd, os.fsdecode(r.stdout).strip())
+    if r.returncode == 0 and os.pathsep not in own:
+        out["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(
+            p for p in (own, env.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")) if p)
+    return out
+
+
+def _literal_paths_env(env):
+    """`env` with every path a git command is given taken as a file name, not
+    a pattern: a file named `:(glob)**` stands only for itself. git refuses
+    that together with a glob or icase setting from the user's environment."""
+    env = {k: v for k, v in env.items()
+           if k not in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")}
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    return env
+
+
+def _add_new_files(cwd, paths, env, tmp_index):
+    """`git add --intent-to-add` the untracked `paths` to the index copy `env`
+    names, so the diff shows them. The add has to store the empty blob, so a
+    user who cannot write the object store gets a second try that stores it in
+    a private directory next to the copy. Nothing needs that blob afterwards:
+    `git diff` reads these files from the work tree. `git stash create` would
+    fail on such an index, and only runs on a copy with nothing added.
+
+    No stdout used here (only returncode matters), but text=True still spawns
+    reader threads that decode stderr — git error messages can reference
+    non-ASCII filenames and crash on cp1252. See #2099. Drop text=True so bytes
+    stay raw."""
+    # For this git add only.
+    env = _literal_paths_env(env)
+
+    def add(add_env):
+        results = _run_git_on_review_paths(
+            ["add", "--intent-to-add"], paths, timeout=10, cwd=cwd, env=add_env)
+        return next((r for r in results if r.returncode != 0), None)
+
+    try:
+        failed = add(env)
+    except subprocess.TimeoutExpired:
+        # No retry: git is slow here, not refused. The diff goes on for the
+        # tracked files, so a timeout on every turn cannot stop their reviews.
+        _note_add_failure(3, paths)
+        return
+    if not failed:
+        return
+    debug_log(f"git add -N failed: {failed.stderr[:200].decode('utf-8', errors='replace')}")
+    # Whatever happens to the retry, the diff goes on for the tracked files.
+    try:
+        objects_dir = tmp_index + _OBJECTS_DIR_SUFFIX
+        os.mkdir(objects_dir, 0o700)
+        retry_failed = add(_env_with_private_objects(env, cwd, objects_dir))
+        if retry_failed:
+            debug_log(f"git add -N retry failed: {retry_failed.stderr[:200].decode('utf-8', errors='replace')}")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        debug_log(f"git add -N retry failed: {e}")
+        retry_failed = True
+    if retry_failed:
+        _note_add_failure(1 if b"empty blob" in failed.stderr else 2, paths)
+    else:
+        _note_add_failure(4, paths)
 
 
 @contextlib.contextmanager
@@ -628,16 +827,7 @@ def _copied_index(cwd, top, real_index, tmpdir, untracked_paths):
         else:
             add_args = None
         if add_args:
-            # No stdout used here (only returncode matters), but text=True
-            # still spawns reader threads that decode stderr — git error
-            # messages can reference non-ASCII filenames and crash on
-            # cp1252. See #2099. Drop text=True so bytes stay raw.
-            _run_git_on_review_paths(
-                ["add", "--intent-to-add"], add_args, timeout=10, cwd=cwd,
-                # The paths are file names, not patterns, for this git add
-                # only: an untracked file named `:(glob)**` must add only
-                # itself.
-                env={**env, "GIT_LITERAL_PATHSPECS": "1"})
+            _add_new_files(cwd, add_args, env, tmp_index)
             # A whole-tree add puts a nested repository back.
             if untracked_paths is None and not _drop_gitlinks(top, env, tmp_index):
                 yield None
@@ -729,26 +919,33 @@ def _gitlink_paths(top, env):
     return found
 
 
+# True when the last _drop_gitlinks call removed at least one gitlink, so the
+# index copy and HEAD can no longer have the same tree even on a clean tree.
+last_dropped_gitlinks = False
+
+
 def _drop_gitlinks(top, env, tmp_index):
     """Remove the gitlink (mode 160000) entry of every nested repository from
     the index copy that `env` names, never from the real index, before
     anything else runs on the copy. A gitlink marks a directory that is, or
     can be, another repository (see diff.ignoreSubmodules in GIT_CMD):
     `git stash create` takes no flag like IGNORE_SUBMODULES, and `git add`
-    reads the gitlinks its paths cover. An entry whose directory has no
-    `.git` stays: git starts nothing there, and without the entry an older
-    `git stash create` fails on the empty directory. `top` is the work
-    tree's top directory. Returns True on success, False on any failure; the
-    copy must not be used then."""
+    reads the gitlinks its paths cover. Every gitlink goes, including one
+    whose directory has no `.git` now: whether git starts something there is
+    decided when git runs, not here. Without the entry, `git stash create` on
+    git older than 2.34 fails on a submodule that is not checked out, and the
+    baseline falls back to HEAD. `top` is the work tree's top directory.
+    Returns True on success, False on any failure; the copy must not be used
+    then."""
+    global last_dropped_gitlinks
+    last_dropped_gitlinks = False
     try:
         if not _may_have_gitlinks(tmp_index):
             return True
         gitlinks = _gitlink_paths(top, env)
         if gitlinks is None:
             return False
-        top_b = os.fsencode(top)
-        nested = sorted(p for p in gitlinks
-                        if os.path.lexists(os.path.join(top_b, p, b".git")))
+        nested = sorted(gitlinks)
         if not nested:
             return True
         mtime_ns = os.stat(tmp_index).st_mtime_ns
@@ -764,6 +961,7 @@ def _drop_gitlinks(top, env, tmp_index):
             return False
         # Keep the mtime the copy came with; see _copied_index.
         os.utime(tmp_index, ns=(mtime_ns, mtime_ns))
+        last_dropped_gitlinks = True
         debug_log(f"gitlink entries (nested repositories) removed from the "
                   f"index copy: {len(nested)}; their contents are not reviewed")
         return True
@@ -771,6 +969,50 @@ def _drop_gitlinks(top, env, tmp_index):
         # RuntimeError: the timer thread could not start.
         debug_log(f"removing gitlinks from the index copy failed: {e}")
         return False
+
+
+def _looks_like_git_dir(path):
+    """git's own test for a repository directory, near enough: objects and refs
+    it can enter, and a HEAD that is a link into refs/ or a file holding a ref
+    or a SHA. Anything else named HEAD stays unopened: a named pipe would block."""
+    # With a commondir file, objects and refs are in the folder that it names.
+    if not (os.path.lexists(os.path.join(path, "commondir"))
+            or ((os.access(os.path.join(path, "objects"), os.X_OK)
+                 or os.environ.get("GIT_OBJECT_DIRECTORY"))
+                and os.access(os.path.join(path, "refs"), os.X_OK))):
+        return False
+    head_path = os.path.join(path, "HEAD")
+    try:
+        mode = os.lstat(head_path).st_mode
+        if stat.S_ISLNK(mode):
+            return os.readlink(head_path).startswith("refs/")  # git does not follow it
+        if not stat.S_ISREG(mode):
+            return False
+        with open(head_path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return False
+    return bool(re.match(rb"ref:\s*refs/|[0-9a-fA-F]{40}", head))
+
+
+def _found_through_bare_folder(cwd):
+    """True when git, searching up from `cwd`, would take a folder with no
+    `.git` entry for the repository. Git versions before 2.38 have no
+    safe.bareRepository, so this is what keeps them to ordinary checkouts.
+    A repository the caller named through the environment is not searched for."""
+    if os.environ.get("GIT_DIR"):
+        return False
+    d = os.path.realpath(cwd or os.curdir)
+    while True:
+        entry = os.path.join(d, ".git")
+        if os.path.isfile(entry) or _looks_like_git_dir(entry):
+            return False  # git passes over an empty `.git` folder or a broken link
+        if _looks_like_git_dir(d):
+            return os.path.basename(d) != ".git"
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
 
 
 def _git_toplevel(cwd):
@@ -786,7 +1028,7 @@ def _git_toplevel(cwd):
         if r.returncode != 0:
             return None
         path = r.stdout.decode("utf-8", errors="replace").strip()
-        return path if path else None
+        return path if path and not _found_through_bare_folder(cwd) else None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
 
@@ -805,7 +1047,10 @@ def _git_toplevel_and_head(cwd):
         return None, None
     # See #2099: the first line is a PATH, so decode the bytes manually.
     top, _, head = r.stdout.decode("utf-8", errors="replace").strip().rpartition("\n")
-    return (top.strip() or None), (head.strip() or None)
+    top = top.strip()
+    if not top or _found_through_bare_folder(cwd):
+        return None, None
+    return top, (head.strip() or None)
 
 
 def _git_head_at(cwd, epoch):
@@ -836,6 +1081,8 @@ def _git_dir(repo_root):
     if a different worktree later pushes it. Returns None on failure so
     callers can degrade (push-sweep state is best-effort).
     """
+    if _found_through_bare_folder(repo_root):
+        return None
     try:
         # See #2099: stdout is a PATH (shared gitdir), may be non-ASCII.
         # Decode bytes manually to avoid cp1252 reader-thread crash.
@@ -857,7 +1104,7 @@ def _git_rev_list_range(repo_root, base, head="HEAD"):
         # See #2099: stdout is ASCII SHAs, but stderr can carry git error
         # messages referencing non-ASCII filenames — keep bytes raw.
         r = subprocess.run(
-            [*GIT_CMD, "rev-list", "--reverse", f"{base}..{head}"],
+            [*GIT_CMD, "rev-list", "--reverse", "--topo-order", f"{base}..{head}"],
             cwd=repo_root, capture_output=True, timeout=10,
         )
         if r.returncode != 0:
@@ -867,8 +1114,62 @@ def _git_rev_list_range(repo_root, base, head="HEAD"):
         return []
 
 
-def _git_diff_range(repo_root, base, head="HEAD"):
-    """`git diff -p base head` as text on success, None on error.
+def _git_range_parents(repo_root, base, head="HEAD"):
+    """{sha: [parent shas, first parent first]} for `base..head`.
+
+    Empty on error: the caller then treats the range as linear, which reviews
+    more, never less.
+    """
+    try:
+        r = subprocess.run(
+            [*GIT_CMD, "rev-list", "--parents", f"{base}..{head}"],
+            cwd=repo_root, capture_output=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return {}
+        rows = [line.split() for line in r.stdout.decode("utf-8", errors="replace").splitlines()]
+        return {row[0]: row[1:] for row in rows if row}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return {}
+
+
+def _git_merge_resolved_files(repo_root, merge_sha):
+    """(path, combined-diff hunks) for each source file a merge changed itself,
+    or None on error.
+
+    The combined diff shows only lines that match none of the merge's parents:
+    conflict resolutions and hand edits. A clean merge has none, and neither
+    does a conflict settled by taking one side whole.
+    """
+    try:
+        r = subprocess.run(
+            [*GIT_CMD, "diff-tree", "--cc", "-M", "--no-commit-id", "-r", "--no-color",
+             "--no-ext-diff", "--no-textconv", merge_sha],
+            cwd=repo_root, capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    files = []
+    # Hunk lines start with one marker column per parent, so only a file
+    # header starts with "diff --cc " in the first column.
+    text = r.stdout.decode("utf-8", errors="replace")
+    for section in re.split(r"^diff --cc ", text, flags=re.M)[1:]:
+        header, _, body = section.partition("\n")
+        path = header
+        if header.startswith('"'):
+            quoted = _read_quoted_path(header, 0)
+            path = quoted[0] if quoted else None
+        at = body.find("@@@")
+        if path and at >= 0 and _section_is_reviewable(path, path):
+            files.append((path, body[at:].rstrip("\n")))
+    return files
+
+
+def _git_diff_range(repo_root, base, head="HEAD", keeper=None):
+    """`git diff -p base head`, as `keeper` leaves it, as text on success, None
+    on error.
 
     Distinguishing failure from success-with-empty-diff matters: the push-sweep
     caller marks the tail reviewed when the diff is empty (nothing to review),
@@ -880,9 +1181,9 @@ def _git_diff_range(repo_root, base, head="HEAD"):
         # non-ASCII paths in `diff --git a/... b/...` headers come through as
         # raw UTF-8, not C-quoted. Required by the downstream
         # parse_diff_into_files / extract_file_paths_from_diff regex.
-        r = subprocess.run(
+        r = _run_diff_bounded(
             [*GIT_CMD, "diff", "-p", "--no-color", "--no-ext-diff", "--no-textconv", base, head],
-            cwd=repo_root, capture_output=True, timeout=30,
+            30, keeper, cwd=repo_root,
         )
         if r.returncode != 0:
             return None
@@ -905,6 +1206,51 @@ def _detect_main_branch(repo_root):
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
     return None
+
+
+# Commits turn_commit_shas reads.
+TURN_COMMITS_MAX = 100
+
+
+def turn_commit_shas(repo_root, since, until, head_before=None):
+    """SHAs that `git commit` made in this checkout from `since` to `until`
+    (epoch seconds), newest first, from its HEAD reflog. None when git cannot
+    say. Not merges, picks, reverts or rebases: no review hook waits for
+    those.
+
+    Goes by the time of the reflog entry, so checking out or pulling
+    somebody's recent commit does not count as making one (a commit made
+    with GIT_COMMITTER_DATE set is dated by that). Those times are whole
+    seconds; `head_before`, what HEAD was at `since`, leaves out the commits
+    made earlier in that second."""
+    try:
+        # --date=unix makes %gd `HEAD@{<seconds>}`; %gs is free text, so last.
+        r = subprocess.run(
+            [*GIT_CMD, "log", "-g", "--no-show-signature", "--date=unix",
+             "--basic-regexp", "--grep-reflog=^commit", "-n", str(TURN_COMMITS_MAX),
+             "--format=%H %gd %gs", "HEAD", "--"],
+            cwd=repo_root, capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        return None
+    if r.returncode != 0:
+        # A repository without a commit has nothing to count.
+        return None if _git_rev_parse_head(repo_root) or not _git_toplevel(repo_root) else []
+    since = int(since)
+    entries = []
+    for line in r.stdout.decode("utf-8", errors="replace").splitlines():
+        # 40 digits only: the reviewed record knows no SHA-256 ids.
+        m = re.match(r"([0-9a-f]{40}) HEAD@\{(\d+)\} commit(?! \((?:merge|cherry-pick)\))", line)
+        if m and since <= int(m.group(2)) <= until:
+            entries.append((m.group(1), int(m.group(2))))
+    # Oldest match, as the turn itself can come back to where it started.
+    for i in range(len(entries) - 1, -1, -1):
+        if entries[i][1] > since:
+            break
+        if entries[i][0] == head_before:
+            del entries[i:]
+            break
+    return list(dict.fromkeys(sha for sha, _ in entries))
 
 
 def _git_reflog_recent_commits(repo_root, max_age_s=120, max_n=5):
@@ -993,6 +1339,37 @@ def _git_reflog_recent_commits(repo_root, max_age_s=120, max_n=5):
     return fresh, stale
 
 
+# New name -> secret-shaped old name, for the renames and copies git reported
+# during this hook run. The Stop review limits its diff to a list of paths:
+# with only the new name in it, git shows the secret's content as a new file,
+# and the diff parsers cannot tell it came from a name they leave out.
+_secret_rename_origins = {}
+
+
+def _note_rename(old_path, new_path):
+    if _is_secret_shaped(old_path):
+        _secret_rename_origins[new_path] = old_path
+
+
+def _name_status_pairs(stdout):
+    """(old path or None, path) for each entry of `git diff --name-status -z`
+    output. Fields are `status\\0path\\0`, or `R<score>\\0old\\0new\\0` for a
+    rename or copy, which is listed by its new name."""
+    fields = (stdout or b"").decode("utf-8", errors="replace").split("\0")
+    i = 0
+    while i + 1 < len(fields):
+        if not fields[i]:
+            # `git log` can put an empty field between two commits.
+            i += 1
+            continue
+        old = None
+        if fields[i][:1] in ("R", "C") and i + 2 < len(fields):
+            old = fields[i + 1]
+            i += 1
+        yield old, fields[i + 1]
+        i += 2
+
+
 def _git_name_only(cwd, base, include_untracked=False):
     """Return the set of repo-root-relative paths that differ from `base`,
     or None if git failed (unresolvable ref, not a repo, timeout). Callers
@@ -1012,7 +1389,7 @@ def _git_name_only(cwd, base, include_untracked=False):
     def _run(env):
         # core.quotePath=false comes from GIT_CMD globally (see definition).
         result = subprocess.run(
-            [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--name-only", "-z", base],
+            [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--name-status", "-z", base],
             cwd=cwd, capture_output=True, timeout=30,
             env=env,
         )
@@ -1020,8 +1397,12 @@ def _git_name_only(cwd, base, include_untracked=False):
             stderr_str = (result.stderr or b"").decode("utf-8", errors="replace")
             debug_log(f"_git_name_only({base!r}) rc={result.returncode}: {stderr_str[:200]}")
             return None
-        stdout = (result.stdout or b"").decode("utf-8", errors="replace")
-        return {p for p in stdout.split("\0") if p}
+        names = set()
+        for old, new in _name_status_pairs(result.stdout):
+            if old:
+                _note_rename(old, new)
+            names.add(new)
+        return names
 
     try:
         # The diff only reads the index (diff.autoRefreshIndex is off in
@@ -1082,6 +1463,8 @@ def _git_status_porcelain(cwd):
                 # 2-char-status entry.
                 if "R" in xy or "C" in xy:
                     i += 1
+                    if i < len(entries):
+                        _note_rename(entries[i], path)
             i += 1
         return tracked, untracked
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as e:
@@ -1142,7 +1525,8 @@ _CUT_MARK = b"\\ [cut by security-guidance: the rest of this file's diff was not
 
 # What the last get_git_diff read, for the Stop hook's metrics: bytes of git
 # output, reviewable files whose diff was cut and the bytes cut from them,
-# and diffs that hit the timeout during this hook run.
+# and diffs that hit the timeout during this hook run. The commit and push
+# reviews report the first and the last.
 _diff_read = {"bytes": 0, "cut_files": 0, "cut_bytes": 0, "timeouts": 0}
 
 
@@ -1292,11 +1676,110 @@ class _DiffKeeper:
         return b"".join(self.parts)
 
 
-def _run_diff_bounded(cmd, timeout, **kwargs):
+# The bytes of a UTF-8 character after its first.
+_UTF8_CONTINUATION = bytes(range(0x80, 0xc0))
+# Added lines past what a file keeps that are still counted.
+_MAX_COUNTED_LINES = 50_000
+# The least read at once of what a file keeps, so bytes that count for little
+# do not make many steps.
+_MIN_PIECE = 1024
+
+
+class _ReviewDiffKeeper(_DiffKeeper):
+    """_DiffKeeper for the commit and push reviews, which send the first
+    `file_chars` characters of a file's diff at most and give up on a diff of
+    more than `max_files` files. A file keeps that many characters, and an
+    empty `+` line for each added line after them: _prioritize_diff_files
+    counts those. A file parse_diff_into_files drops keeps the lines before
+    its content, which say where it came from. Past `max_files` only what the
+    parser needs to list each file is kept, for the ones already read too.
+    What comes before the first file (`git show` prints the commit there) is
+    not kept."""
+
+    def __init__(self, max_files, file_chars):
+        super().__init__()
+        self._max_files = max_files
+        self._file_chars = file_chars
+        self._files = set()   # with a hunk, so far
+        self._heads = []      # each section, cut down to list its file
+        self._section = []
+        self._path = None
+        # What the section still takes, and the added lines after that.
+        self._chars_left = self._bytes_left = 0
+        self._more_added = 0
+        self._after_nl = False
+        # A section's first hunk starts within this many bytes: the lines
+        # before it name each path two more times at most, as `rename from`
+        # and `rename to`, and as `---` and `+++`.
+        self._head_bytes = 0
+
+    def _over(self):
+        return len(self._files) > self._max_files
+
+    def _begin(self, header):
+        self._end_section()
+        text = header[len(_SECTION_MARK) - 1:].decode("utf-8", errors="replace")
+        paths = _parse_diff_header(text)
+        path = paths and (paths[1] or paths[0])
+        self._path = path if path and _section_is_reviewable(path, paths[0]) else None
+        self._head_bytes = self._chars_left = 3 * len(header) + 512
+        if self._path and not self._over():
+            # More than the review takes, so it still says the file was cut.
+            self._chars_left += self._file_chars + 1
+        # Text that is not UTF-8 can be all continuation bytes.
+        self._bytes_left = 4 * self._chars_left
+
+    def _keep(self, buf, start, end):
+        if self._at_start and end > start:
+            self._at_start = False
+            start += 1
+        self.seen += max(end - start, 0)
+        while start < end and self._chars_left > 0 and self._bytes_left > 0:
+            piece = buf[start:min(end, start + max(self._chars_left, _MIN_PIECE),
+                                  start + self._bytes_left)]
+            self._section.append(piece)
+            self._bytes_left -= len(piece)
+            self._chars_left -= len(piece.translate(None, _UTF8_CONTINUATION))
+            self._after_nl = piece.endswith(b"\n")
+            start += len(piece)
+        if start < end and self._path and not self._over():
+            self._more_added += (buf.count(b"\n+", start, end)
+                                 + (self._after_nl and buf.startswith(b"+", start)))
+            self._after_nl = buf.endswith(b"\n", start, end)
+
+    def _end_section(self):
+        data = b"".join(self._section)
+        more_added = min(self._more_added, _MAX_COUNTED_LINES)
+        self._section = []
+        self._chars_left = self._bytes_left = self._more_added = 0
+        if not data:
+            return
+        if not data.endswith(b"\n"):
+            data += b"\n"
+        head = data[:self._head_bytes]
+        if self._path:
+            at = head.find(b"\n@@")
+            if at >= 0:
+                head = head[:head.index(b"\n")] + b"\n@@\n"
+                self._files.add(self._path)
+        else:
+            at = head.find(b"\n--- ")
+            head = head[:at + 1] if at >= 0 else head
+        if not head.endswith(b"\n"):
+            # The next file's header has to start a line.
+            head += b"\n"
+        self._heads.append(head)
+        if self._over():
+            self.parts = self._heads
+        else:
+            self.parts.append(data + b"+\n" * more_added if self._path else head)
+
+
+def _run_diff_bounded(cmd, timeout, keeper=None, **kwargs):
     """subprocess.run(cmd, capture_output=True, timeout=timeout) for a
-    `git diff`, except that stdout goes through _DiffKeeper instead of being
+    `git diff`, except that stdout goes through a _DiffKeeper instead of being
     held whole."""
-    keeper = _DiffKeeper()
+    keeper = keeper or _DiffKeeper()
     deadline = time.monotonic() + timeout
     try:
         err = tempfile.TemporaryFile()
@@ -1388,6 +1871,7 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
     MAX_FILE_DIFF_BYTES is cut down to its added lines.
     """
     _path_list_too_long.clear()
+    _add_failed["left_out"] = False
     pathspec = _diff_pathspec(cwd, paths)
     if paths and not pathspec:
         # Caller restricted to specific paths but none are inside this repo
@@ -1743,6 +2227,11 @@ def _parse_diff_header(header):
     `"a/we\\"ird.py" "b/we\\"ird.py"`. Either side can be quoted on its own.
     """
     old = new = None
+    # The same name on both sides, as in every section but a rename or a copy.
+    # A name that contains ` b/` can only be told apart this way.
+    same = header[2:(len(header) - 1) // 2]
+    if same and header == f"a/{same} b/{same}":
+        return same, same
     if header.startswith('"'):
         first = _read_quoted_path(header, 0)
         if not first:
@@ -1780,11 +2269,32 @@ def _section_is_reviewable(file_path, old_path):
     return _is_reviewable_source(file_path) and not _skip_secret_shaped(old_path)
 
 
+def _rename_of(lines):
+    """(old path, new path) of a section git shows as a rename or a copy, or
+    None. Read from its `rename from` / `rename to` lines, where each path
+    stands alone; the header line is ambiguous when a name contains ` b/`."""
+    old = None
+    for line in lines:
+        if line.startswith('@@'):
+            break
+        m = re.match(r'(?:rename|copy) (from|to) (.+)', line)
+        if not m:
+            continue
+        path = m.group(2)
+        if path.startswith('"'):
+            quoted = _read_quoted_path(path, 0)
+            path = quoted[0] if quoted else path
+        if m.group(1) == 'to':
+            return (old, path) if old else None
+        old = path
+    return None
+
+
 def _iter_diff_sections(diff_output):
     """Yield (new_path, old_path, lines after the header line) per file section."""
     for section in _DIFF_SECTION_RE.split(diff_output)[1:]:
         lines = section.split('\n')
-        paths = _parse_diff_header(lines[0])
+        paths = _rename_of(lines[1:]) or _parse_diff_header(lines[0])
         if paths:
             yield paths[1] or paths[0], paths[0], lines[1:]
         else:
@@ -1833,6 +2343,129 @@ def parse_diff_into_files(diff_output):
             files.append((file_path, '\n'.join(diff_lines)))
 
     return files
+
+
+# Names whose content the commit and push reviews never read although it can
+# be code: text and documents. Not every name they leave out: a key, an
+# archive or a vendored file under a new name is still what it was.
+_TEXT_EXTENSIONS = frozenset(('.txt', '.text', '.md', '.markdown', '.rst'))
+_DATA_EXTENSIONS = frozenset((
+    '.json', '.yaml', '.yml', '.toml', '.properties', '.tfvars', '.ipynb',
+))
+_CODE_EXTENSIONS = SOURCE_CODE_EXTENSIONS - _DATA_EXTENSIONS
+
+
+# Text that holds secrets by its name or its folder's (`api_keys.txt`,
+# `keys/prod.md`, `.ssh/notes.txt`). It stays unread when it becomes code; so
+# does a document that only has such a word in its name (`hotkeys.md`).
+_SECRET_TEXT_RE = re.compile(
+    r"(?:secrets?|credentials?|creds?|passwords?|passwd|keys?|tokens?|vault"
+    r"|/\.(?:ssh|aws|gnupg|kube))/"
+    r"|(?:secret|credential|passw|passphrase|api.?key|recovery.?code|service.?account)[^/]*$"
+    r"|(?:keys?|tokens?|creds?|pass|pwd|env|logins|pem|ed25519|netrc|npmrc)"
+    r"(?![a-z])[^/]*$")
+
+
+def _is_secret_stem(file_path):
+    """`credentials.txt`, `id_rsa.md`: a secret's name with an extension."""
+    stem = os.path.splitext(os.path.basename(file_path))[0].lower()
+    return (_is_secret_shaped(stem) or stem in _SECRET_NAMED_STEMS
+            or stem.startswith('password'))
+
+
+def _is_secret_text(file_path):
+    """Whether a name says the file holds secrets, if it is not a code name."""
+    path = "/" + file_path.replace("\\", "/").lower()
+    return (_is_secret_shaped(file_path)
+            or os.path.splitext(path)[1] not in _CODE_EXTENSIONS
+            and os.path.basename(path) not in SOURCE_CODE_BASENAMES
+            and (_is_secret_stem(path) or bool(_SECRET_TEXT_RE.search(path))))
+
+
+def _is_text_turned_code(old_path, new_path):
+    ext = os.path.splitext(new_path)[1].lower()
+    return (os.path.splitext(old_path)[1].lower() in _TEXT_EXTENSIONS
+            and not _is_secret_text(old_path) and not _is_secret_stem(new_path)
+            and (ext in _CODE_EXTENSIONS
+                 or os.path.basename(new_path).lower() in SOURCE_CODE_BASENAMES)
+            and _section_is_reviewable(new_path, old_path)
+            and not _is_reviewable_source(old_path))
+
+
+def renamed_into_review(diff_output):
+    """The new names of the files a diff renames or copies from a text name
+    the review leaves out (`notes.txt`) to a code name it reviews. git shows
+    only what changed across a rename, and nothing at all when the content did
+    not, so what nobody reviewed as text would never be read as code.
+
+    Empty when the diff also removes or renames a secret-shaped file: git
+    picks which old name a new file came from, and between two alike it can be
+    the other one.
+    """
+    if "\nrename to " not in diff_output and "\ncopy to " not in diff_output:
+        return []
+    names = []
+    for file_path, old_path, lines in _iter_diff_sections(diff_output):
+        renamed = _rename_of(lines)
+        if (renamed or lines[:1] and lines[0].startswith("deleted file mode")) \
+                and _is_secret_shaped(old_path):
+            return []
+        if renamed and _is_text_turned_code(old_path, file_path):
+            names.append(file_path)
+    return names
+
+
+# How many commits back came_from_secret looks.
+_SECRET_ORIGIN_COMMITS = 50
+
+
+def came_from_secret(repo_root, rev, paths, timeout):
+    """Those of `paths` at `rev` that one of the last commits renamed from a
+    secret's name, whatever they were called in between. None on error."""
+    try:
+        result = subprocess.run(
+            [*GIT_CMD, "-c", "log.diffMerges=separate", "log", "-m",
+             "-n", str(_SECRET_ORIGIN_COMMITS), "--format=", "--name-status", "-z",
+             "--no-ext-diff", rev, "--"],
+            cwd=repo_root, capture_output=True, timeout=timeout,
+            # A partial clone would download old files to compare them.
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+    except (subprocess.TimeoutExpired, OSError) as e:
+        debug_log(f"came_from_secret: {e}")
+        return None
+    if result.returncode != 0:
+        return None
+    # Newest commit first: every name each path has had so far.
+    had = {path: {path} for path in paths}
+    for old, new in _name_status_pairs(result.stdout):
+        for names in had.values():
+            if old and new in names:
+                names.add(old)
+    return {path for path, names in had.items() if any(map(_is_secret_text, names))}
+
+
+def git_diff_unpaired(repo_root, revs, paths, timeout):
+    """{path: hunks} for those of `paths` the commit or range `revs` names
+    (`show` or `diff` arguments) changed, each shown whole instead of against
+    the name it was renamed from. Empty hunks for a file git shows none for (a
+    binary one). None on error."""
+    try:
+        result = _run_diff_bounded(
+            [*GIT_CMD, revs[0], "-p", "--no-renames", "--no-color", "--no-ext-diff",
+             "--no-textconv", *revs[1:], "--", *paths],
+            timeout, cwd=repo_root, env=_literal_paths_env(os.environ))
+    except (subprocess.TimeoutExpired, OSError) as e:
+        debug_log(f"git_diff_unpaired: {e}")
+        return None
+    if result.returncode != 0:
+        debug_log(f"git_diff_unpaired: rc={result.returncode}: "
+                  f"{result.stderr[:200].decode('utf-8', errors='replace')}")
+        return None
+    text = result.stdout.decode("utf-8", errors="replace")
+    # A path that used to be a directory also matches the files under it.
+    shown = {name: "" for name, _, _ in _iter_diff_sections(text)}
+    shown.update(parse_diff_into_files(text))
+    return {name: hunks for name, hunks in shown.items() if name in paths}
 
 
 def filter_preexisting_from_diff(diff_files, cwd, baseline_sha):
